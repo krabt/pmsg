@@ -1,0 +1,164 @@
+package httpclient
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"mime/multipart"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"time"
+)
+
+var ErrRequest = errors.New("http request failed")
+
+const (
+	HdrKeyContentType = "Content-Type"
+)
+
+const (
+	HdrValApplicationJson         = "application/json"
+	HdrValApplicationJsonCharset  = "application/json; charset=utf-8"
+	HdrValApplicationJsonEncoding = "application/json; encoding=utf-8"
+)
+
+const (
+	Timeout = 30 * time.Second
+)
+
+var Default = &http.Client{
+	Transport: &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		IdleConnTimeout:        Timeout,
+		TLSHandshakeTimeout:    5 * time.Second,
+		ResponseHeaderTimeout:  10 * time.Second,
+		ExpectContinueTimeout:  1 * time.Second,
+		WriteBufferSize:        32 * 1024,
+		ReadBufferSize:         32 * 1024,
+		MaxResponseHeaderBytes: 32 * 1024,
+		ForceAttemptHTTP2:      true,
+	},
+	Timeout: Timeout,
+}
+
+var userAgent string
+
+func SetUserAgent(v string) {
+	userAgent = v
+}
+
+func SetTransport(v *http.Transport) {
+	Default.Transport = v
+}
+
+// Get http get
+func Get(url string) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodGet, url, http.NoBody)
+	if err != nil {
+		return nil, err
+	}
+
+	return Default.Do(req)
+}
+
+// Post http post
+func Post(url, contentType string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodPost, url, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set(HdrKeyContentType, contentType)
+
+	return Default.Do(req)
+}
+
+func fileToBody(bodyWriter *multipart.Writer, formName, fileName string) (err error) {
+	var fileWriter io.Writer
+	fileWriter, err = bodyWriter.CreateFormFile(formName, filepath.Base(fileName))
+	if err != nil {
+		return fmt.Errorf("multipart.Writer.CreateFormFile failed, %w", err)
+	}
+
+	var f *os.File
+	f, err = os.Open(fileName)
+	if err != nil {
+		return fmt.Errorf("open file failed, %w", err)
+	}
+	defer func() {
+		if tmpErr := f.Close(); tmpErr != nil {
+			err = fmt.Errorf("close file failed, %w", tmpErr)
+		}
+	}()
+
+	if _, err := io.Copy(fileWriter, f); err != nil {
+		return fmt.Errorf("io.Copy failed, %w", err)
+	}
+
+	return nil
+}
+
+// MultipartForm 保存文件或其他字段信息
+type MultipartForm struct {
+	params map[string][]string
+	files  map[string]string
+}
+
+func NewMultipartForm() *MultipartForm {
+	return &MultipartForm{
+		params: make(map[string][]string),
+		files:  make(map[string]string),
+	}
+}
+
+// AddFile 保存文件信息
+func (t *MultipartForm) AddFile(name, fileName string) *MultipartForm {
+	t.files[name] = fileName
+	return t
+}
+
+// AddParam 保存参数信息
+func (t *MultipartForm) AddParam(name, value string) *MultipartForm {
+	if param, ok := t.params[name]; ok {
+		t.params[name] = append(param, value)
+	} else {
+		t.params[name] = []string{value}
+	}
+	return t
+}
+
+// PostMultipartForm 上传文件或其他多个字段
+func PostMultipartForm(url string, form *MultipartForm) (*http.Response, error) {
+	bodyBuf := new(bytes.Buffer)
+	bodyWriter := multipart.NewWriter(bodyBuf)
+
+	for formName, fileName := range form.files {
+		if err := fileToBody(bodyWriter, formName, fileName); err != nil {
+			return nil, err
+		}
+	}
+	for k, v := range form.params {
+		for _, vv := range v {
+			if err := bodyWriter.WriteField(k, vv); err != nil {
+				return nil, fmt.Errorf("multipart.Writer.WriteField failed, %w", err)
+			}
+		}
+	}
+	contentType := bodyWriter.FormDataContentType()
+	if err := bodyWriter.Close(); err != nil {
+		return nil, fmt.Errorf("multipart.Writer.Close failed, %w", err)
+	}
+	return Post(url, contentType, bodyBuf)
+}
+
+// PostFile 上传文件
+func PostFile(url, formName, fileName string) (*http.Response, error) {
+	form := NewMultipartForm().AddFile(formName, fileName)
+	return PostMultipartForm(url, form)
+}
